@@ -1,17 +1,11 @@
 """
-DJI Mic Bridge — Background service that continuously buffers mic audio
-and exposes an HTTP endpoint to clip the last 90 seconds.
+DJI Mic Bridge — Multi-source audio buffer service.
 
-Features:
-    - Rolling 90s audio buffer from DJI Mic via Bluetooth
-    - HTTP trigger at /clip for Stream Deck plugin
-    - Alt+F10 global hotkey auto-clips alongside ShadowPlay
-    - Auto-reconnects when BT mic disconnects/reconnects
-    - Autostart-friendly (see autostart.py)
+Buffers audio from multiple DJI devices (mic + camera) and exposes
+HTTP endpoints to clip them. Alt+F10 clips all sources at once.
 
 Usage:
-    python service.py              # Start with auto-detected DJI Mic
-    python service.py --device 3   # Start with specific device index
+    python service.py              # Start with auto-detected devices
     python service.py --list       # List available audio devices
 """
 
@@ -28,23 +22,14 @@ import sounddevice as sd
 import soundfile as sf
 from flask import Flask, jsonify
 
-from config import (
-    AUDIO_FORMAT,
-    BUFFER_SECONDS,
-    CHANNELS,
-    CLIPS_DIR,
-    DEVICE_NAME,
-    HOST,
-    PORT,
-    SAMPLE_RATE,
-)
+from config import AUDIO_FORMAT, BUFFER_SECONDS, HOST, PORT, SOURCES
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("dji-mic")
+log = logging.getLogger("dji-bridge")
 
 
 class AudioBuffer:
@@ -60,7 +45,6 @@ class AudioBuffer:
         self.lock = threading.Lock()
 
     def write(self, data: np.ndarray):
-        """Write incoming audio data into the circular buffer."""
         frames = len(data)
         with self.lock:
             if frames >= self.max_frames:
@@ -68,7 +52,6 @@ class AudioBuffer:
                 self.write_pos = 0
                 self.total_written += frames
                 return
-
             end_pos = self.write_pos + frames
             if end_pos <= self.max_frames:
                 self.buffer[self.write_pos:end_pos] = data
@@ -76,12 +59,10 @@ class AudioBuffer:
                 first = self.max_frames - self.write_pos
                 self.buffer[self.write_pos:] = data[:first]
                 self.buffer[:frames - first] = data[first:]
-
             self.write_pos = end_pos % self.max_frames
             self.total_written += frames
 
     def read(self) -> np.ndarray:
-        """Read the entire buffer in chronological order."""
         with self.lock:
             if self.total_written < self.max_frames:
                 return self.buffer[:self.write_pos].copy()
@@ -91,7 +72,6 @@ class AudioBuffer:
             ])
 
     def reset(self):
-        """Clear the buffer."""
         with self.lock:
             self.buffer[:] = 0
             self.write_pos = 0
@@ -104,260 +84,275 @@ class AudioBuffer:
         return frames / self.sample_rate
 
 
-# --- Globals ---
-audio_buf: AudioBuffer | None = None
-stream: sd.InputStream | None = None
-mic_connected = False
-_args = None  # parsed CLI args, stored for reconnect
+class AudioSource:
+    """Manages one audio device: stream, buffer, and reconnection."""
 
+    def __init__(self, name: str, cfg: dict):
+        self.name = name
+        self.device_name = cfg["device_name"]
+        self.sample_rate = cfg["sample_rate"]
+        self.channels = cfg["channels"]
+        self.clips_dir = cfg["clips_dir"]
+        self.prefer_api = cfg.get("prefer_api", "")
+        self.buffer = AudioBuffer(BUFFER_SECONDS, self.sample_rate, self.channels)
+        self.stream: sd.InputStream | None = None
+        self.connected = False
+        self.device_idx: int | None = None
 
-def find_dji_device(name_hint: str | None = None) -> int | None:
-    """Find the DJI Mic device index by name substring match."""
-    sd._terminate()
-    sd._initialize()
-    devices = sd.query_devices()
-    candidates = []
-    for i, dev in enumerate(devices):
-        if dev["max_input_channels"] < 1:
-            continue
-        dev_name = dev["name"].lower()
-        if name_hint and name_hint.lower() in dev_name:
-            candidates.append((i, dev))
-        elif not name_hint and "dji" in dev_name:
-            candidates.append((i, dev))
-
-    if not candidates:
-        return None
-    # Prefer DirectSound endpoint (highest quality for BT audio)
-    for idx, dev in candidates:
-        hostapi = sd.query_hostapis(dev["hostapi"])["name"]
-        if "directsound" in hostapi.lower():
-            return idx
-    # Fallback: prefer highest sample rate
-    candidates.sort(key=lambda x: x[1]["default_samplerate"], reverse=True)
-    return candidates[0][0]
-
-
-def audio_callback(indata, frames, time_info, status):
-    """Called by sounddevice for each audio block."""
-    if status:
-        log.warning(f"audio: {status}")
-    if audio_buf is not None:
-        audio_buf.write(indata.copy())
-
-
-def start_stream(device_idx: int, rate: int, channels: int) -> bool:
-    """Start the audio input stream. Returns True on success."""
-    global stream, mic_connected
-    try:
-        if stream is not None:
+    def find_device(self, refresh: bool = False) -> int | None:
+        if refresh:
             try:
-                stream.stop()
-                stream.close()
+                sd._terminate()
+                sd._initialize()
             except Exception:
                 pass
+        devices = sd.query_devices()
+        candidates = []
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] < 1:
+                continue
+            if self.device_name.lower() in dev["name"].lower():
+                candidates.append((i, dev))
+        if not candidates:
+            return None
+        # Prefer the specified host API
+        if self.prefer_api:
+            for idx, dev in candidates:
+                hostapi = sd.query_hostapis(dev["hostapi"])["name"]
+                if self.prefer_api.lower() in hostapi.lower():
+                    return idx
+        # Fallback: highest sample rate
+        candidates.sort(key=lambda x: x[1]["default_samplerate"], reverse=True)
+        return candidates[0][0]
 
-        dev_info = sd.query_devices(device_idx)
-        actual_channels = min(channels, dev_info["max_input_channels"])
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            log.warning(f"[{self.name}] {status}")
+        self.buffer.write(indata.copy())
 
-        stream = sd.InputStream(
-            device=device_idx,
-            samplerate=rate,
-            channels=actual_channels,
-            dtype="float32",
-            callback=audio_callback,
-            blocksize=1024,
-        )
-        stream.start()
-        mic_connected = True
-        log.info(f"stream started: [{device_idx}] {dev_info['name']} @ {rate}Hz")
-        return True
-    except Exception as e:
-        mic_connected = False
-        log.error(f"stream start failed: {e}")
-        return False
-
-
-def stop_stream():
-    """Stop the audio input stream."""
-    global stream, mic_connected
-    if stream is not None:
+    def start(self, device_idx: int | None = None) -> bool:
         try:
-            stream.stop()
-            stream.close()
+            self.stop()
+            if device_idx is None:
+                device_idx = self.find_device()
+            if device_idx is None:
+                return False
+            dev_info = sd.query_devices(device_idx)
+            ch = min(self.channels, dev_info["max_input_channels"])
+            self.stream = sd.InputStream(
+                device=device_idx,
+                samplerate=self.sample_rate,
+                channels=ch,
+                dtype="float32",
+                callback=self._callback,
+                blocksize=1024,
+            )
+            self.stream.start()
+            self.connected = True
+            self.device_idx = device_idx
+            log.info(f"[{self.name}] started: [{device_idx}] {dev_info['name']} @ {self.sample_rate}Hz ch={ch}")
+            return True
+        except Exception as e:
+            self.connected = False
+            log.error(f"[{self.name}] start failed: {e}")
+            return False
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.connected = False
+
+    def check_alive(self) -> bool:
+        if not self.connected:
+            return False
+        try:
+            if self.stream is not None and not self.stream.active:
+                self.connected = False
+                return False
         except Exception:
-            pass
-        stream = None
-    mic_connected = False
+            self.connected = False
+            return False
+        return True
+
+    def save_clip(self) -> Path:
+        if self.buffer.seconds_buffered == 0:
+            raise RuntimeError(f"[{self.name}] buffer empty")
+        data = self.buffer.read()
+        self.clips_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"{self.name}_{ts}.{AUDIO_FORMAT}"
+        filepath = self.clips_dir / filename
+        sf.write(str(filepath), data, self.buffer.sample_rate)
+        dur = len(data) / self.buffer.sample_rate
+        log.info(f"[{self.name}] clip: {dur:.1f}s -> {filepath}")
+        return filepath
+
+    def status_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "connected": self.connected,
+            "buffered_seconds": round(self.buffer.seconds_buffered, 1),
+            "device": self.device_idx,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+        }
+
+
+# --- Globals ---
+sources: dict[str, AudioSource] = {}
 
 
 def reconnect_loop():
-    """Background thread: monitor mic connection and auto-reconnect."""
-    global mic_connected
+    """Monitor all sources and auto-reconnect."""
     while True:
         time.sleep(5)
-        if mic_connected:
-            # Check if stream is still alive
-            if stream is not None and not stream.active:
-                log.warning("stream died, attempting reconnect...")
-                mic_connected = False
-
-        if not mic_connected:
-            device_idx = _args.device if _args and _args.device is not None else None
-            if device_idx is None:
-                device_idx = find_dji_device(DEVICE_NAME)
-
-            if device_idx is not None:
-                rate = _args.rate if _args else SAMPLE_RATE
-                log.info(f"mic detected at [{device_idx}], reconnecting...")
-                if audio_buf:
-                    audio_buf.reset()
-                start_stream(device_idx, rate, CHANNELS)
-            # If not found, just keep polling silently
+        disconnected = [src for src in sources.values() if not src.check_alive()]
+        if not disconnected:
+            continue
+        for src in disconnected:
+            idx = src.find_device(refresh=True)
+            if idx is not None:
+                log.info(f"[{src.name}] reconnecting...")
+                src.buffer.reset()
+                src.start(idx)
 
 
-def save_clip() -> Path:
-    """Save the current buffer to a timestamped audio file."""
-    if audio_buf is None or audio_buf.seconds_buffered == 0:
-        raise RuntimeError("Buffer is empty — no audio recorded yet")
-
-    data = audio_buf.read()
-    CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"mic_{timestamp}.{AUDIO_FORMAT}"
-    filepath = CLIPS_DIR / filename
-
-    sf.write(str(filepath), data, audio_buf.sample_rate)
-    duration = len(data) / audio_buf.sample_rate
-    log.info(f"clip saved: {duration:.1f}s -> {filepath}")
-    return filepath
+def clip_all() -> dict:
+    """Clip all connected sources. Returns results per source."""
+    results = {}
+    for name, src in sources.items():
+        try:
+            if src.connected:
+                path = src.save_clip()
+                results[name] = {"status": "ok", "file": str(path)}
+            else:
+                results[name] = {"status": "skipped", "message": "not connected"}
+        except Exception as e:
+            results[name] = {"status": "error", "message": str(e)}
+    return results
 
 
-# --- Flask HTTP trigger ---
+# --- Flask ---
 app = Flask(__name__)
 app.logger.setLevel(logging.WARNING)
 
 
 @app.route("/clip", methods=["GET", "POST"])
-def clip_endpoint():
-    """Trigger a clip save."""
+def clip_all_endpoint():
+    """Clip all sources."""
+    results = clip_all()
+    return jsonify({"status": "ok", "sources": results})
+
+
+@app.route("/clip/<source_name>", methods=["GET", "POST"])
+def clip_one_endpoint(source_name):
+    """Clip a single source by name."""
+    src = sources.get(source_name)
+    if not src:
+        return jsonify({"status": "error", "message": f"unknown source: {source_name}"}), 404
     try:
-        path = save_clip()
-        return jsonify({
-            "status": "ok",
-            "file": str(path),
-            "seconds": audio_buf.seconds_buffered,
-        })
+        path = src.save_clip()
+        return jsonify({"status": "ok", "file": str(path), "seconds": src.buffer.seconds_buffered})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/status")
 def status_endpoint():
-    """Check service health and buffer status."""
+    """Status of all sources."""
+    src_status = {name: src.status_dict() for name, src in sources.items()}
+    any_connected = any(s.connected for s in sources.values())
     return jsonify({
         "status": "running",
-        "mic_connected": mic_connected,
-        "buffered_seconds": round(audio_buf.seconds_buffered, 1) if audio_buf else 0,
-        "device": stream.device if stream else None,
-        "sample_rate": _args.rate if _args else SAMPLE_RATE,
+        "mic_connected": any_connected,
+        "buffered_seconds": max((s.buffer.seconds_buffered for s in sources.values()), default=0),
+        "sources": src_status,
     })
 
 
 def list_devices():
-    """Print all available audio input devices."""
     devices = sd.query_devices()
     print("\nAvailable input devices:\n")
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
-            marker = " <-- DJI?" if "dji" in dev["name"].lower() else ""
-            print(f"  [{i}] {dev['name']} "
-                  f"(ch={dev['max_input_channels']}, "
-                  f"sr={dev['default_samplerate']:.0f}){marker}")
+            hostapi = sd.query_hostapis(dev["hostapi"])["name"]
+            markers = []
+            for name, cfg in SOURCES.items():
+                if cfg["device_name"].lower() in dev["name"].lower():
+                    markers.append(name)
+            tag = f" <-- {','.join(markers)}" if markers else ""
+            print(f"  [{i}] {dev['name']} (ch={dev['max_input_channels']}, sr={dev['default_samplerate']:.0f}, api={hostapi}){tag}")
     print()
 
 
 def setup_hotkey():
-    """Register Alt+F10 global hotkey to auto-clip alongside ShadowPlay."""
     try:
         import keyboard
+
         def on_alt_f10():
-            log.info("Alt+F10 detected — clipping mic audio")
-            try:
-                save_clip()
-            except Exception as e:
-                log.error(f"hotkey clip failed: {e}")
+            log.info("Alt+F10 -> clipping all sources")
+            clip_all()
 
         keyboard.add_hotkey("alt+f10", on_alt_f10, suppress=False)
-        log.info("hotkey registered: Alt+F10 -> clip")
+        log.info("hotkey: Alt+F10 -> clip all")
     except ImportError:
-        log.warning("keyboard module not installed — Alt+F10 hotkey disabled")
+        log.warning("keyboard module not installed — hotkey disabled")
     except Exception as e:
         log.warning(f"hotkey setup failed: {e}")
 
 
 def main():
-    global audio_buf, _args
+    global sources
 
-    parser = argparse.ArgumentParser(description="DJI Mic Bridge Service")
+    parser = argparse.ArgumentParser(description="DJI Audio Bridge Service")
     parser.add_argument("--list", action="store_true", help="List audio devices and exit")
-    parser.add_argument("--device", type=int, default=None, help="Audio device index (from --list)")
-    parser.add_argument("--rate", type=int, default=SAMPLE_RATE, help="Sample rate (Hz)")
-    parser.add_argument("--duration", type=int, default=BUFFER_SECONDS, help="Buffer duration (seconds)")
     parser.add_argument("--port", type=int, default=PORT, help="HTTP server port")
     args = parser.parse_args()
-    _args = args
 
     if args.list:
         list_devices()
         sys.exit(0)
 
-    # Resolve device
-    device_idx = args.device
-    if device_idx is None:
-        device_idx = find_dji_device(DEVICE_NAME)
+    # Create sources
+    for name, cfg in SOURCES.items():
+        sources[name] = AudioSource(name, cfg)
+        log.info(f"[{name}] {cfg['device_name']} -> {cfg['clips_dir']}")
 
-    actual_rate = args.rate
+    # Start all sources
+    for src in sources.values():
+        src.start()
+        if not src.connected:
+            log.warning(f"[{src.name}] not found — waiting for connection...")
 
-    log.info(f"buffer: {args.duration}s rolling @ {actual_rate}Hz")
-    log.info(f"clips dir: {CLIPS_DIR.resolve()}")
-    log.info(f"HTTP trigger: http://{HOST}:{args.port}/clip")
+    # Reconnect thread
+    threading.Thread(target=reconnect_loop, daemon=True).start()
 
-    # Init buffer
-    audio_buf = AudioBuffer(args.duration, actual_rate, CHANNELS)
-
-    # Start audio stream (or wait for mic to connect)
-    if device_idx is not None:
-        start_stream(device_idx, actual_rate, CHANNELS)
-    else:
-        log.warning("DJI Mic not found — waiting for Bluetooth connection...")
-
-    # Start reconnect monitor
-    reconnect_thread = threading.Thread(target=reconnect_loop, daemon=True)
-    reconnect_thread.start()
-
-    # Register Alt+F10 hotkey
+    # Hotkey
     setup_hotkey()
 
-    # Run Flask in a thread
+    # HTTP server
     import werkzeug.serving
-    werkzeug_log = logging.getLogger("werkzeug")
-    werkzeug_log.setLevel(logging.ERROR)
-
-    server_thread = threading.Thread(
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    threading.Thread(
         target=lambda: app.run(host=HOST, port=args.port, threaded=True, use_reloader=False),
         daemon=True,
-    )
-    server_thread.start()
+    ).start()
 
-    log.info("service running — press Ctrl+C to stop")
+    log.info(f"HTTP: http://{HOST}:{args.port}/clip")
+    log.info("service running — Ctrl+C to stop")
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("shutting down...")
-        stop_stream()
+        for src in sources.values():
+            src.stop()
 
 
 if __name__ == "__main__":

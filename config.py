@@ -2,20 +2,27 @@
 
 from pathlib import Path
 
-# Audio device — set to None to auto-detect DJI Mic, or set exact name
-# Run `python -m sounddevice` to list devices
-DEVICE_NAME: str | None = "DJI Mic"  # Auto-detect DJI Mic 3 TX Bluetooth
-
-# Buffer duration in seconds
+# Buffer duration in seconds (shared)
 BUFFER_SECONDS: int = 90
+AUDIO_FORMAT: str = "flac"
 
-# Audio settings — DirectSound at 44100Hz for max quality
-SAMPLE_RATE: int = 44100
-CHANNELS: int = 1
-
-# Output — save to S: drive
-CLIPS_DIR: Path = Path("S:/dji-mic-clips")
-AUDIO_FORMAT: str = "flac"  # lossless compression
+# --- Audio Sources ---
+SOURCES = {
+    "mic": {
+        "device_name": "DJI Mic",       # BT keyboard mic
+        "sample_rate": 44100,
+        "channels": 1,
+        "clips_dir": Path("S:/dji-mic-clips"),
+        "prefer_api": "directsound",     # best quality for BT
+    },
+    "cam": {
+        "device_name": "OsmoAction5pro", # wired action camera
+        "sample_rate": 48000,
+        "channels": 2,
+        "clips_dir": Path("S:/dji-cam-clips"),
+        "prefer_api": "wasapi",          # best for USB
+    },
+}
 
 # HTTP trigger server
 HOST: str = "127.0.0.1"
