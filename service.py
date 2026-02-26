@@ -218,7 +218,6 @@ def reconnect_loop():
             idx = src.find_device(refresh=True)
             if idx is not None:
                 log.info(f"[{src.name}] reconnecting...")
-                src.buffer.reset()
                 src.start(idx)
 
 
@@ -266,11 +265,12 @@ def clip_one_endpoint(source_name):
 def status_endpoint():
     """Status of all sources."""
     src_status = {name: src.status_dict() for name, src in sources.items()}
-    any_connected = any(s.connected for s in sources.values())
+    mic_src = sources.get("mic")
+    mic_connected = mic_src.connected if mic_src else False
     return jsonify({
         "status": "running",
-        "mic_connected": any_connected,
-        "buffered_seconds": max((s.buffer.seconds_buffered for s in sources.values()), default=0),
+        "mic_connected": mic_connected,
+        "buffered_seconds": round(mic_src.buffer.seconds_buffered, 1) if mic_src and mic_connected else 0,
         "sources": src_status,
     })
 
