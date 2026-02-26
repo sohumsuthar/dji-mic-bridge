@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+clips/
+icons/*.b64
+icons/*.txt
